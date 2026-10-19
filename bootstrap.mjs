@@ -306,6 +306,8 @@ async function main() {
   } finally { rl.close(); }
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+// ESM canonicalizes symlinked paths (e.g. macOS /var -> /private/var), but argv
+// keeps the original spelling. Compare real paths so temporary-folder launches run.
+if (process.argv[1] && await realpath(process.argv[1]).catch(() => null) === await realpath(fileURLToPath(import.meta.url))) {
   main().catch(error => { console.error(`\nSetup stopped: ${error.message}\nExisting research data and local checkout edits were not removed. Fix the issue and rerun the installer.`); process.exitCode = 1; });
 }
