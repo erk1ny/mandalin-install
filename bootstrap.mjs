@@ -2,7 +2,7 @@
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { createWriteStream } from 'node:fs';
-import { access, appendFile, mkdir, mkdtemp, readFile, readdir, realpath, writeFile } from 'node:fs/promises';
+import { access, appendFile, copyFile, mkdir, mkdtemp, readFile, readdir, realpath, stat, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { basename, delimiter, dirname, join, resolve } from 'node:path';
 import { createInterface } from 'node:readline/promises';
@@ -31,9 +31,48 @@ export function stableTag(output) {
 }
 
 export function checksumFor(text, name) {
-  const line = text.split(/\r?\n/u).map(value => /^([a-f\d]{64})\s+\*?(.+)$/iu.exec(value)).find(value => value?.[2] === name);
-  if (!line) throw new Error(`No SHA-256 checksum for ${name}`);
-  return line[1].toLowerCase();
+  const lines = text.split(/\r?\n/u).map(value => /^([a-f\d]{64})\s+\*?(.+)$/iu.exec(value)).filter(value => value?.[2] === name);
+  if (!lines.length) throw new Error(`No SHA-256 checksum for ${name}`);
+  if (lines.length !== 1) throw new Error(`Ambiguous SHA-256 checksums for ${name}`);
+  return lines[0][1].toLowerCase();
+}
+
+export async function prepareBurpInstall({ ref, fetchRelease, prepareSource }) {
+  if (ref === 'main') return { javaHome: await prepareSource() };
+  if (!/^v\d+\.\d+\.\d+$/u.test(ref)) throw new Error('Unsupported Burp install reference.');
+  // Never silently fall back to a local Java build when a stable asset is missing.
+  return { release: await fetchRelease(ref) };
+}
+
+export async function fetchReleasedBurp({ ref, gh, invoke, directory }) {
+  if (!/^v\d+\.\d+\.\d+$/u.test(ref)) throw new Error('Invalid stable release tag.');
+  const version = ref.slice(1); const name = `mandalin-burp-${version}.jar`;
+  const result = await invoke(gh, ['release', 'view', ref, '--repo', REPOSITORY, '--json', 'tagName,isDraft,isPrerelease,assets'], { capture: true, allowFailure: true, timeout: 30_000 });
+  if (result.code !== 0) throw new Error(`Stable release ${ref} is not accessible or not published yet. Wait for publication or check GitHub access, then rerun. No JDK download or source build was attempted.`);
+  const release = JSON.parse(result.stdout);
+  if (release.tagName !== ref || release.isDraft || release.isPrerelease) throw new Error(`${ref} is not a published stable release.`);
+  for (const asset of [name, 'SHA256SUMS.txt']) {
+    if (release.assets?.filter(item => item.name === asset && item.state === 'uploaded').length !== 1) throw new Error(`Release ${ref} is missing ${asset}. Wait for publication to finish; no source-build fallback was attempted.`);
+  }
+  await mkdir(directory, { recursive: true });
+  const work = await mkdtemp(join(directory, `burp-${ref}-`));
+  console.log(`Downloading prebuilt Burp extension for ${ref}; no JDK or Gradle is needed...`);
+  await invoke(gh, ['release', 'download', ref, '--repo', REPOSITORY, '--pattern', name, '--pattern', 'SHA256SUMS.txt', '--dir', work], { timeout: 120_000 });
+  const file = join(work, name); const sumsFile = join(work, 'SHA256SUMS.txt');
+  if ((await stat(file)).size > 64 * 1024 * 1024 || (await stat(sumsFile)).size > 1024 * 1024) throw new Error('Release artifact exceeds its safety limit.');
+  const sums = await readFile(sumsFile, 'utf8'); const checksum = checksumFor(sums, name);
+  if (checksumFor(sums, 'mandalin-burp.jar') !== checksum) throw new Error('Stable and versioned Burp JAR checksums disagree.');
+  if (createHash('sha256').update(await readFile(file)).digest('hex') !== checksum) throw new Error('Burp JAR checksum mismatch; refusing installation.');
+  console.log(`Verified ${name} (SHA-256).`);
+  return { version, file, checksum };
+}
+
+export async function installReleasedBurp(root, release) {
+  const manifest = JSON.parse(await readFile(join(root, 'release.json'), 'utf8'));
+  if (!/^\d+\.\d+\.\d+$/u.test(release.version) || manifest.mandalinVersion !== release.version) throw new Error('Released Burp JAR does not match the application checkout version.');
+  if (createHash('sha256').update(await readFile(release.file)).digest('hex') !== release.checksum) throw new Error('Burp JAR changed after verification; refusing installation.');
+  await copyFile(release.file, join(root, `mandalin-burp-${release.version}.jar`));
+  await copyFile(release.file, join(root, 'mandalin-burp.jar'));
 }
 
 export function shellQuote(value) { return `'${value.replaceAll("'", "'\\''")}'`; }
@@ -290,19 +329,19 @@ export async function verifyCheckout(root, { invoke = run, repository = REPOSITO
 }
 
 export async function configureUnixShell({ home, appHome, prefix = join(appHome, 'cli'), nodeBin, javaHome, ghBin, shell = process.env.SHELL ?? '', ask }) {
-  const paths = [...new Set([join(prefix, 'bin'), nodeBin, join(javaHome, 'bin'), ...(ghBin ? [ghBin] : [])])];
+  const paths = [...new Set([join(prefix, 'bin'), nodeBin, ...(javaHome ? [join(javaHome, 'bin')] : []), ...(ghBin ? [ghBin] : [])])];
   const envPath = join(appHome, 'env.sh');
-  const envText = `# Generated by Mandalin setup. Remove its source line from your shell profile to undo.\nexport MANDALIN_HOME=${shellQuote(appHome)}\nexport JAVA_HOME=${shellQuote(javaHome)}\nexport PATH=${shellQuote(paths.join(':'))}:"$PATH"\n`;
+  const envText = `# Generated by Mandalin setup. Remove its source line from your shell profile to undo.\nexport MANDALIN_HOME=${shellQuote(appHome)}\n${javaHome ? `export JAVA_HOME=${shellQuote(javaHome)}\n` : ''}export PATH=${shellQuote(paths.join(':'))}:"$PATH"\n`;
   await writeFile(envPath, envText, { mode: 0o600 });
   const shellName = basename(shell);
   const profiles = shellName === 'zsh' ? ['.zshrc'] : shellName === 'bash' ? ['.bashrc', '.bash_profile'] : shellName === 'fish' ? ['.config/fish/config.fish'] : ['.profile'];
   let sourceLine = `. ${shellQuote(envPath)}`;
   if (shellName === 'fish') {
     const fishPath = join(appHome, 'env.fish');
-    await writeFile(fishPath, `# Generated by Mandalin setup\nset -gx MANDALIN_HOME ${shellQuote(appHome)}\nset -gx JAVA_HOME ${shellQuote(javaHome)}\nfish_add_path ${paths.map(shellQuote).join(' ')}\n`, { mode: 0o600 });
+    await writeFile(fishPath, `# Generated by Mandalin setup\nset -gx MANDALIN_HOME ${shellQuote(appHome)}\n${javaHome ? `set -gx JAVA_HOME ${shellQuote(javaHome)}\n` : ''}fish_add_path ${paths.map(shellQuote).join(' ')}\n`, { mode: 0o600 });
     sourceLine = `source ${shellQuote(fishPath)}`;
   }
-  if (await ask(`Add Mandalin's Node/Java/CLI paths to ${profiles.join(' and ')}? Existing settings will be preserved.`)) {
+  if (await ask(`Add Mandalin's Node/${javaHome ? 'Java/' : ''}CLI paths to ${profiles.join(' and ')}? Existing settings will be preserved.`)) {
     for (const profile of profiles) {
       const file = join(home, profile); const before = await exists(file) ? await readFile(file, 'utf8') : '';
       if (before.split(/\r?\n/u).includes(sourceLine)) continue;
@@ -360,16 +399,13 @@ async function main() {
 
     const remoteOptions = { capture: true, allowFailure: true, timeout: 30_000 };
     let ghBin; let ghPath;
-    console.log('Checking existing Git access to Mandalin...');
-    const refs = await repositoryRefs({
-      readRefs: () => invoke('git', ['ls-remote', '--tags', '--refs', REPOSITORY_URL], { ...remoteOptions, env: { ...env, GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never' } }),
-      env, ask, choose, capture, invoke,
-      getGh: async () => {
+    const getGh = async () => {
+      if (ghPath) return ghPath;
       const healthy = async candidate => { try { return (await capture(candidate, ['--version'], { timeout: 15_000 })).code === 0; } catch { return false; } };
       let gh = await findManagedRuntime(runtimes, 'gh-', ['bin', spec.windows ? 'gh.exe' : 'gh'], healthy);
       if (!gh) { const system = await executable('gh', env); if (system && await healthy(system)) gh = system; }
       if (!gh) {
-        if (!await ask('Git cannot access the private repository. Download GitHub CLI locally to start browser/device login?')) throw new Error('GitHub authentication is required.');
+        if (!await ask('Download GitHub CLI locally for private repository/release access and browser login if needed?')) throw new Error('GitHub CLI is required for this setup path.');
         console.log('Fetching GitHub CLI download metadata...');
         const release = JSON.parse(await text('https://api.github.com/repos/cli/cli/releases/latest'));
         const asset = release.assets.find(item => item.name.endsWith(`_${spec.ghOs}_${spec.ghArch}.${spec.ghExtension}`));
@@ -384,7 +420,11 @@ async function main() {
       }
       ghPath = gh; ghBin = dirname(gh); addPath(ghBin);
       return gh;
-      },
+    };
+    console.log('Checking existing Git access to Mandalin...');
+    const refs = await repositoryRefs({
+      readRefs: () => invoke('git', ['ls-remote', '--tags', '--refs', REPOSITORY_URL], { ...remoteOptions, env: { ...env, GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never' } }),
+      env, ask, choose, capture, invoke, getGh,
     });
     let ref = stableTag(refs.stdout);
     if (!ref) {
@@ -393,6 +433,16 @@ async function main() {
     }
     console.log(`Selected ${REPOSITORY} ${ref}. Stable discovery follows Git tags, not completed GitHub release uploads.`);
 
+    const preparedBurp = await prepareBurpInstall({ ref,
+      fetchRelease: async tag => {
+        const gh = await getGh();
+        // Git access may use SSH or another credential store; verify gh separately
+        // before asking it to download private release assets.
+        await repositoryRefs({ readRefs: () => capture(gh, ['api', '--hostname', 'github.com', `repos/${REPOSITORY}`, '--jq', '.full_name'], { timeout: 30_000 }),
+          env, ask, choose, capture, invoke, getGh });
+        return fetchReleasedBurp({ ref: tag, gh, invoke, directory: join(appHome, 'downloads') });
+      },
+      prepareSource: async () => {
     const javaName = spec.windows ? 'java.exe' : 'java';
     const healthyJava = async java => {
       try {
@@ -428,12 +478,20 @@ async function main() {
       if (!java || !await healthyJava(java)) throw new Error('JDK 21 executable missing or cannot run on this system.');
       javaHome = dirname(dirname(java));
     }
-    env.JAVA_HOME = javaHome; addPath(join(javaHome, 'bin'));
+    return javaHome;
+      },
+    });
+    const javaHome = preparedBurp.javaHome;
+    if (javaHome) { env.JAVA_HOME = javaHome; addPath(join(javaHome, 'bin')); }
     console.log('Preparing the application checkout...');
     if (await verifyCheckout(root, { invoke })) {
       await invoke('git', ['-C', root, 'fetch', 'origin', ref === 'main' ? 'refs/heads/main' : `refs/tags/${ref}`]);
       await invoke('git', ['-C', root, 'merge', '--ff-only', 'FETCH_HEAD']);
     } else await invoke('git', ['clone', '--branch', ref, '--single-branch', REPOSITORY_URL, root]);
+    if (preparedBurp.release) {
+      await installReleasedBurp(root, preparedBurp.release);
+      env.MANDALIN_SKIP_BURP_BUILD = '1';
+    } else delete env.MANDALIN_SKIP_BURP_BUILD;
     if (ghPath && env.GIT_CONFIG_COUNT && env[`GIT_CONFIG_VALUE_${Number(env.GIT_CONFIG_COUNT) - 2}`]?.endsWith(' auth git-credential')) {
       // Future updates need the same helper, but only this managed checkout gets it.
       await invoke('git', ['-C', root, 'config', '--local', '--replace-all', 'credential.https://github.com.helper', '']);
@@ -444,13 +502,13 @@ async function main() {
     await invoke(process.execPath, [join(root, 'installer', 'install.mjs')], { cwd: root, timeout: 1_800_000 });
 
     if (spec.windows) {
-      const additions = [prefix, dirname(process.execPath), join(javaHome, 'bin'), ...(ghBin ? [ghBin] : [])];
-      if (await ask('Add Mandalin, Node and Java to your user PATH and set user JAVA_HOME/MANDALIN_HOME? No machine-wide settings are changed.')) {
+      const additions = [prefix, dirname(process.execPath), ...(javaHome ? [join(javaHome, 'bin')] : []), ...(ghBin ? [ghBin] : [])];
+      if (await ask(`Add Mandalin and Node${javaHome ? '/Java' : ''} to your user PATH and set ${javaHome ? 'JAVA_HOME/' : ''}MANDALIN_HOME? No machine-wide settings are changed.`)) {
         const before = await invoke('powershell.exe', ['-NoProfile', '-Command', '$ErrorActionPreference = "Stop"; @{ Path = [Environment]::GetEnvironmentVariable("Path","User"); JAVA_HOME = [Environment]::GetEnvironmentVariable("JAVA_HOME","User"); MANDALIN_HOME = [Environment]::GetEnvironmentVariable("MANDALIN_HOME","User") } | ConvertTo-Json -Compress'], { capture: true });
         const snapshot = JSON.parse(before.stdout.trim());
         await writeFile(join(appHome, `windows-env-backup-${Date.now()}.json`), JSON.stringify(snapshot, null, 2), { mode: 0o600 });
         const path = mergeUserPath(snapshot.Path, additions);
-        await invoke('powershell.exe', ['-NoProfile', '-Command', '[Environment]::SetEnvironmentVariable("Path",$env:MANDALIN_NEW_PATH,"User"); [Environment]::SetEnvironmentVariable("JAVA_HOME",$env:JAVA_HOME,"User"); [Environment]::SetEnvironmentVariable("MANDALIN_HOME",$env:MANDALIN_HOME,"User")'], { env: { ...env, MANDALIN_NEW_PATH: path } });
+        await invoke('powershell.exe', ['-NoProfile', '-Command', '[Environment]::SetEnvironmentVariable("Path",$env:MANDALIN_NEW_PATH,"User"); if ($env:MANDALIN_SETUP_JAVA -eq "1") { [Environment]::SetEnvironmentVariable("JAVA_HOME",$env:JAVA_HOME,"User") }; [Environment]::SetEnvironmentVariable("MANDALIN_HOME",$env:MANDALIN_HOME,"User")'], { env: { ...env, MANDALIN_NEW_PATH: path, MANDALIN_SETUP_JAVA: javaHome ? '1' : '0' } });
       }
       console.log('Open a new terminal for user PATH changes.');
     } else await configureUnixShell({ home, appHome, prefix, nodeBin: dirname(process.execPath), javaHome, ghBin, ask });
