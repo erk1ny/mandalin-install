@@ -57,6 +57,12 @@ from authentication and repository visibility. `GH_TOKEN`/`GITHUB_TOKEN` can
 override saved accounts; browser login offers to ignore them for setup only.
 It does not change your shell's tokens, proxy or TLS verification settings.
 
+For browser login, press Enter at GitHub CLI's prompt, enter the displayed device
+code, and approve authorization. Merely signing into GitHub in a browser does not
+complete CLI login. Setup rechecks repository access after authorization finishes.
+Account switching lists saved alternatives explicitly and verifies the selected
+account. If none are saved, use browser login to add one.
+
 ## Platforms and boundaries
 
 - macOS: x64/ARM64, Bash/Zsh/Fish shell setup; native dependency support depends

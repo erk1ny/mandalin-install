@@ -37,6 +37,14 @@ export function checksumFor(text, name) {
 }
 
 export function shellQuote(value) { return `'${value.replaceAll("'", "'\\''")}'`; }
+export async function terminalQuestion(message, { input = process.stdin, output = process.stdout } = {}) {
+  // pause() stops the stream but leaves readline's TTY raw mode enabled. A child
+  // such as gh then receives CR instead of the canonical newline it waits for.
+  // Keep no readline interface alive while a child owns the terminal.
+  const prompt = createInterface({ input, output });
+  try { return await prompt.question(message); }
+  finally { prompt.close(); input.pause(); }
+}
 export function mergeUserPath(current, additions) {
   const entries = (current ?? '').split(';').filter(Boolean);
   for (const addition of additions) if (!entries.some(entry => entry.replace(/[\\/]+$/u, '').toLowerCase() === addition.replace(/[\\/]+$/u, '').toLowerCase())) entries.push(addition);
@@ -78,6 +86,35 @@ export function githubCredentialEnvironment(env, gh) {
   return next;
 }
 
+export async function switchGithubAccount({ gh, capture, invoke, choose, log = console.log, env = {} }) {
+  const status = await capture(gh, ['auth', 'status', '--hostname', 'github.com', '--json', 'hosts'], { timeout: 30_000 });
+  let accounts;
+  try { accounts = JSON.parse(status.stdout).hosts?.['github.com']; } catch { /* CLI error handled below. */ }
+  if (status.code !== 0 || !Array.isArray(accounts)) {
+    log(`Could not list saved GitHub accounts: ${safeDiagnostic(status.stderr, env)}. Use browser login instead.`);
+    return false;
+  }
+  const active = new Set(accounts.filter(account => account.active).map(account => account.login));
+  const names = [...new Set(accounts.map(account => account.login).filter(name => typeof name === 'string' && /^[\w-]+$/u.test(name) && !active.has(name)))];
+  if (!names.length) {
+    log('No other GitHub account is saved. Choose browser login to add the account with Mandalin access.');
+    return false;
+  }
+  const choice = await choose('Select a saved GitHub account', [...names, 'Back']);
+  if (choice === names.length) return false;
+  const selected = names[choice];
+  if (!selected) throw new Error('Invalid GitHub account selection.');
+  const switched = await invoke(gh, ['auth', 'switch', '--hostname', 'github.com', '--user', selected], { timeout: 30_000, allowFailure: true });
+  if (switched.code !== 0) { log('Account switch failed. Use browser login to authenticate that account again.'); return false; }
+  const identity = await capture(gh, ['api', '--hostname', 'github.com', 'user', '--jq', '.login'], { timeout: 30_000 });
+  if (identity.code !== 0 || identity.stdout.trim().toLowerCase() !== selected.toLowerCase()) {
+    log('The selected GitHub account could not be verified after switching. Use browser login; no successful switch is claimed.');
+    return false;
+  }
+  log(`Verified GitHub account: ${selected}`);
+  return true;
+}
+
 export async function repositoryRefs({ readRefs, getGh, capture, invoke, env, ask, choose, log = console.log }) {
   let refs = await readRefs(); let gh; let helperConfigured = false;
   while (refs.code !== 0) {
@@ -116,11 +153,15 @@ export async function repositoryRefs({ readRefs, getGh, capture, invoke, env, as
         if (!await ask('Ignore GH_TOKEN/GITHUB_TOKEN only for this installer so browser/saved-account login can be used? Your shell settings will stay unchanged.')) continue;
         delete env.GH_TOKEN; delete env.GITHUB_TOKEN;
       }
-      const auth = await invoke(gh, action === 1
-        ? ['auth', 'login', '--hostname', 'github.com', '--git-protocol', 'https', '--web']
-        : ['auth', 'switch', '--hostname', 'github.com'], { timeout: 900_000, allowFailure: true });
-      if (auth.code !== 0) { log('GitHub authentication did not complete. You can retry, choose another method, or cancel.'); continue; }
+      if (action === 2) {
+        if (!await switchGithubAccount({ gh, capture, invoke, choose, log, env })) continue;
+      } else {
+        log('Press Enter at GitHub CLI\'s browser prompt, then enter its one-time device code and approve access in the browser. Simply signing into github.com is not enough. Setup will recheck repository access when authorization finishes.');
+        const auth = await invoke(gh, ['auth', 'login', '--hostname', 'github.com', '--git-protocol', 'https', '--web'], { timeout: 900_000, allowFailure: true });
+        if (auth.code !== 0) { log('GitHub authentication did not complete. You can retry, choose another method, or cancel.'); continue; }
+      }
       if (!helperConfigured) { Object.assign(env, githubCredentialEnvironment(env, gh)); helperConfigured = true; }
+      log('GitHub authentication returned. Rechecking Mandalin repository access now...');
     }
     refs = await readRefs();
   }
@@ -276,16 +317,14 @@ export async function configureUnixShell({ home, appHome, prefix = join(appHome,
 async function main() {
   const spec = platformSpec();
   if (!process.stdin.isTTY && process.env.MANDALIN_BOOTSTRAP_INTERACTIVE !== '1') throw new Error('Use an interactive terminal for setup. Login and approvals cannot be answered through the download pipe.');
-  const rl = createInterface({ input: process.stdin, output: process.stdout });
   const ask = async message => {
-    const answer = await rl.question(`${message} [y/N] `);
-    rl.pause(); // Do not steal terminal input from gh login, sudo, or other children.
+    const answer = await terminalQuestion(`${message} [y/N] `);
     return /^(y|yes)$/iu.test(answer.trim());
   };
   const choose = async (message, options) => {
     console.log(`\n${message}\n${options.map((option, index) => `  ${index + 1}. ${option}`).join('\n')}`);
     while (true) {
-      const answer = (await rl.question(`Choose [1-${options.length}, default ${options.length}]: `)).trim(); rl.pause();
+      const answer = (await terminalQuestion(`Choose [1-${options.length}, default ${options.length}]: `)).trim();
       if (!answer) return options.length - 1;
       const value = Number(answer);
       if (Number.isInteger(value) && value >= 1 && value <= options.length) return value - 1;
@@ -314,7 +353,7 @@ async function main() {
       if (!await ask(`Install ${plan.label}?`)) throw new Error('Git is required. Setup cancelled without cloning.');
       if (spec.platform === 'linux' && process.getuid?.() !== 0) await invoke('sudo', [plan.command, ...plan.args]);
       else await invoke(plan.command, plan.args, { allowFailure: Boolean(plan.wait) });
-      if (plan.wait) { await rl.question('Finish Apple’s Command Line Tools installer, then press Enter: '); rl.pause(); }
+      if (plan.wait) await terminalQuestion('Finish Apple’s Command Line Tools installer, then press Enter: ');
       if (spec.windows) for (const candidate of [join(env.ProgramFiles ?? 'C:\\Program Files', 'Git', 'cmd'), join(env.LOCALAPPDATA ?? join(home, 'AppData', 'Local'), 'Programs', 'Git', 'cmd')]) if (await exists(candidate)) addPath(candidate);
       if ((await capture('git', ['--version'])).code !== 0) throw new Error('Git is not ready. Complete its installation and rerun setup.');
     }
@@ -420,11 +459,10 @@ async function main() {
       const target = join(appHome, 'welcome'); await mkdir(target, { recursive: true });
       const cli = join(root, 'dist', 'apps', 'mandalin', 'src', 'cli.js');
       const supportsSetup = (await capture(process.execPath, [cli, '--help'])).stdout.includes('mandalin setup');
-      rl.close();
       console.log(`${supportsSetup ? 'Sign in through Connections' : 'Press c for Connections and sign in'}, then press Esc and n for a chat. Run mandalin from your own target folder for investigations.`);
       await invoke(process.execPath, [cli, ...(supportsSetup ? ['setup'] : [])], { cwd: target, timeout: 0 });
     }
-  } finally { rl.close(); }
+  } finally { process.stdin.pause(); }
 }
 
 // ESM canonicalizes symlinked paths (e.g. macOS /var -> /private/var), but argv
