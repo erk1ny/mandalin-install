@@ -43,12 +43,87 @@ export function mergeUserPath(current, additions) {
   return entries.join(';');
 }
 
-export async function repositoryRefs({ readRefs, signIn }) {
-  let refs = await readRefs();
-  if (refs.code === 0) return refs;
-  await signIn();
-  refs = await readRefs();
-  if (refs.code !== 0) throw new Error(`GitHub login did not grant repository access. Ask the owner to invite this account to ${REPOSITORY}; check connectivity too. No repository was cloned.`);
+export function safeDiagnostic(value, env = {}) {
+  let result = String(value ?? '');
+  for (const key of ['GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN']) {
+    if (env[key]) result = result.split(env[key]).join('[redacted]');
+  }
+  return result.replace(/\x1b\[[0-?]*[ -/]*[@-~]/gu, '').replace(/[\x00-\x08\x0b-\x1f\x7f]/gu, '')
+    .replace(/(https?:\/\/)[^\s/@]+@/giu, '$1[redacted]@')
+    .replace(/\b(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+)/gu, '[redacted]')
+    .replace(/(authorization:\s*(?:bearer|basic)\s+)\S+/giu, '$1[redacted]').slice(-2000).trim();
+}
+
+export function isTransportFailure(result) {
+  return result.code === 124 || /could not resolve|failed to connect|connection (?:refused|timed out|reset)|couldn't connect|certificate|SSL|TLS|proxy|network is unreachable/iu.test(result.stderr ?? '');
+}
+
+// Reset inherited helpers only for Git commands launched by this installer. No
+// tokens in arguments, files or logs, and no global Git configuration changes.
+export function githubCredentialEnvironment(env, gh) {
+  const next = { ...env }; const count = Number(next.GIT_CONFIG_COUNT ?? 0);
+  if (!Number.isSafeInteger(count) || count < 0) throw new Error('Invalid inherited GIT_CONFIG_COUNT.');
+  const settings = [
+    ['credential.https://github.com.helper', ''],
+    ['credential.https://github.com.helper', `!${shellQuote(gh.replaceAll('\\', '/'))} auth git-credential`],
+    // A common global https->ssh rewrite otherwise bypasses gh credentials entirely.
+    // Longest-prefix matching limits this override to the Mandalin repository.
+    [`url.${REPOSITORY_URL}.insteadOf`, REPOSITORY_URL],
+  ];
+  for (const [index, [key, value]] of settings.entries()) {
+    next[`GIT_CONFIG_KEY_${count + index}`] = key;
+    next[`GIT_CONFIG_VALUE_${count + index}`] = value;
+  }
+  next.GIT_CONFIG_COUNT = String(count + settings.length);
+  return next;
+}
+
+export async function repositoryRefs({ readRefs, getGh, capture, invoke, env, ask, choose, log = console.log }) {
+  let refs = await readRefs(); let gh; let helperConfigured = false;
+  while (refs.code !== 0) {
+    log(`Git could not read ${REPOSITORY}: ${safeDiagnostic(refs.stderr || `exit ${refs.code}`, env)}`);
+    if (isTransportFailure(refs)) {
+      log('This is a connection, proxy or TLS failure; signing in will not repair it. No network/security settings were changed.');
+      if (!await ask('Fix the connection settings, then retry now?')) throw new Error('Setup cancelled before repository access. Installed runtimes will be reused.');
+      refs = await readRefs(); continue;
+    }
+    gh ??= await getGh();
+    const identity = await capture(gh, ['api', '--hostname', 'github.com', 'user', '--jq', '.login'], { timeout: 30_000 });
+    const login = identity.code === 0 && /^[\w-]+$/u.test(identity.stdout.trim()) ? identity.stdout.trim() : null;
+    log(login ? `GitHub CLI account: ${login}` : `GitHub CLI has no usable login: ${safeDiagnostic(identity.stderr, env)}`);
+    if (env.GH_TOKEN || env.GITHUB_TOKEN) log('An environment token overrides saved GitHub accounts. Its value is not displayed.');
+    if (login && !helperConfigured) {
+      Object.assign(env, githubCredentialEnvironment(env, gh)); helperConfigured = true;
+      log('Checking Git access over HTTPS using GitHub CLI credentials (installer-only, no global Git changes)...');
+      refs = await readRefs(); if (refs.code === 0) return refs;
+      if (isTransportFailure(refs)) continue;
+      log(`Git still failed: ${safeDiagnostic(refs.stderr, env)}`);
+    }
+    if (login) {
+      const visibility = await capture(gh, ['api', '--hostname', 'github.com', `repos/${REPOSITORY}`, '--jq', '.full_name'], { timeout: 30_000 });
+      if (visibility.code === 0) log('The account can see the repository through GitHub API. The remaining failure is in Git transport/configuration, not proof of missing membership.');
+      else log(`Repository access for ${login} is not verified: ${safeDiagnostic(visibility.stderr, env)}\nCheck the accepted invitation, token repository permissions and organization SSO authorization.`);
+    }
+    const action = await choose('GitHub access', [
+      'Retry access after fixing permissions or connection settings',
+      'Sign in through the browser (choose the GitHub account with Mandalin access)',
+      'Switch to another account already saved in GitHub CLI',
+      'Cancel setup',
+    ]);
+    if (action === 3) throw new Error('Setup cancelled before repository access. Installed runtimes will be reused.');
+    if (action === 1 || action === 2) {
+      if (env.GH_TOKEN || env.GITHUB_TOKEN) {
+        if (!await ask('Ignore GH_TOKEN/GITHUB_TOKEN only for this installer so browser/saved-account login can be used? Your shell settings will stay unchanged.')) continue;
+        delete env.GH_TOKEN; delete env.GITHUB_TOKEN;
+      }
+      const auth = await invoke(gh, action === 1
+        ? ['auth', 'login', '--hostname', 'github.com', '--git-protocol', 'https', '--web']
+        : ['auth', 'switch', '--hostname', 'github.com'], { timeout: 900_000, allowFailure: true });
+      if (auth.code !== 0) { log('GitHub authentication did not complete. You can retry, choose another method, or cancel.'); continue; }
+      if (!helperConfigured) { Object.assign(env, githubCredentialEnvironment(env, gh)); helperConfigured = true; }
+    }
+    refs = await readRefs();
+  }
   return refs;
 }
 
@@ -83,12 +158,16 @@ function run(command, args, { env = process.env, cwd, capture = false, timeout =
     let stdout = ''; let stderr = '';
     child.stdout?.on('data', chunk => { stdout = (stdout + chunk).slice(-4 * 1024 * 1024); });
     child.stderr?.on('data', chunk => { stderr = (stderr + chunk).slice(-64 * 1024); });
-    const timer = timeout > 0 ? setTimeout(() => { child.kill(); reject(new Error(`${basename(command)} timed out. No install completion is claimed; rerun when ready.`)); }, timeout) : undefined;
+    const timer = timeout > 0 ? setTimeout(() => {
+      child.kill();
+      if (allowFailure) resolveResult({ code: 124, stdout, stderr: `${stderr}\n${basename(command)} timed out.` });
+      else reject(new Error(`${basename(command)} timed out. No install completion is claimed; rerun when ready.`));
+    }, timeout) : undefined;
     child.on('error', error => { clearTimeout(timer); reject(error); });
     child.on('close', code => {
       clearTimeout(timer);
       if (code === 0 || allowFailure) resolveResult({ code, stdout, stderr });
-      else reject(new Error(`${basename(command)} failed (exit ${code}). See the command output above; setup has not completed.`));
+      else reject(new Error(`${basename(command)} failed (exit ${code}). ${capture ? safeDiagnostic(stderr, env) : 'See the command output above.'} Setup has not completed.`));
     });
   });
 }
@@ -116,8 +195,8 @@ async function text(url) {
 
 export async function download(url, file, expected, { fetchResponse = response } = {}) {
   if (!/^[a-f\d]{64}$/iu.test(expected)) throw new Error('Missing or invalid download checksum.');
-  const res = await fetchResponse(url); const hash = createHash('sha256'); let bytes = 0; let last = Date.now();
   console.log(`Downloading ${basename(file)}...`);
+  const res = await fetchResponse(url); const hash = createHash('sha256'); let bytes = 0; let last = Date.now();
   await pipeline(Readable.fromWeb(res.body), new Transform({ transform(chunk, _encoding, callback) {
     bytes += chunk.length;
     if (bytes > 512 * 1024 * 1024) { callback(new Error('Runtime archive exceeds 512 MiB.')); return; }
@@ -147,10 +226,22 @@ async function findFile(directory, suffix, depth = 5) {
   return null;
 }
 
+export async function findManagedRuntime(runtimes, prefix, suffix, validate) {
+  if (!await exists(runtimes)) return null;
+  for (const entry of (await readdir(runtimes, { withFileTypes: true })).sort((a, b) => b.name.localeCompare(a.name))) {
+    if (!entry.isDirectory() || !entry.name.startsWith(prefix)) continue;
+    try {
+      const candidate = await findFile(join(runtimes, entry.name), suffix);
+      if (candidate && await validate(candidate)) return candidate;
+    } catch { /* An interrupted or unreadable old download is not a usable runtime. */ }
+  }
+  return null;
+}
+
 export async function verifyCheckout(root, { invoke = run, repository = REPOSITORY_URL } = {}) {
   if (!await exists(root)) return false;
   if (!await exists(join(root, '.git'))) throw new Error(`Install directory already exists and is not a Git checkout: ${root}. Nothing was overwritten.`);
-  const origin = (await invoke('git', ['-C', root, 'remote', 'get-url', 'origin'], { capture: true })).stdout.trim();
+  const origin = (await invoke('git', ['-C', root, 'config', '--get', 'remote.origin.url'], { capture: true })).stdout.trim();
   if (origin !== repository) throw new Error('Existing checkout belongs to another repository. Nothing was overwritten.');
   const dirty = (await invoke('git', ['-C', root, 'status', '--porcelain'], { capture: true })).stdout.trim();
   if (dirty) throw new Error('Existing checkout has local changes. Commit or move them yourself before rerunning; the installer will not discard them.');
@@ -191,6 +282,16 @@ async function main() {
     rl.pause(); // Do not steal terminal input from gh login, sudo, or other children.
     return /^(y|yes)$/iu.test(answer.trim());
   };
+  const choose = async (message, options) => {
+    console.log(`\n${message}\n${options.map((option, index) => `  ${index + 1}. ${option}`).join('\n')}`);
+    while (true) {
+      const answer = (await rl.question(`Choose [1-${options.length}, default ${options.length}]: `)).trim(); rl.pause();
+      if (!answer) return options.length - 1;
+      const value = Number(answer);
+      if (Number.isInteger(value) && value >= 1 && value <= options.length) return value - 1;
+      console.log('Enter one of the listed numbers.');
+    }
+  };
   const home = homedir(); const appHome = resolve(process.env.MANDALIN_HOME ?? join(home, '.mandalin'));
   const root = join(appHome, 'app'); const runtimes = join(appHome, 'runtimes');
   const prefix = resolve(process.env.MANDALIN_PREFIX ?? join(appHome, 'cli'));
@@ -218,14 +319,19 @@ async function main() {
       if ((await capture('git', ['--version'])).code !== 0) throw new Error('Git is not ready. Complete its installation and rerun setup.');
     }
 
-    const remoteOptions = { env: { ...env, GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never' }, capture: true, allowFailure: true, timeout: 30_000 };
-    let ghBin;
+    const remoteOptions = { capture: true, allowFailure: true, timeout: 30_000 };
+    let ghBin; let ghPath;
+    console.log('Checking existing Git access to Mandalin...');
     const refs = await repositoryRefs({
       readRefs: () => invoke('git', ['ls-remote', '--tags', '--refs', REPOSITORY_URL], { ...remoteOptions, env: { ...env, GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never' } }),
-      signIn: async () => {
-      let gh = await executable('gh', env);
+      env, ask, choose, capture, invoke,
+      getGh: async () => {
+      const healthy = async candidate => { try { return (await capture(candidate, ['--version'], { timeout: 15_000 })).code === 0; } catch { return false; } };
+      let gh = await findManagedRuntime(runtimes, 'gh-', ['bin', spec.windows ? 'gh.exe' : 'gh'], healthy);
+      if (!gh) { const system = await executable('gh', env); if (system && await healthy(system)) gh = system; }
       if (!gh) {
         if (!await ask('Git cannot access the private repository. Download GitHub CLI locally to start browser/device login?')) throw new Error('GitHub authentication is required.');
+        console.log('Fetching GitHub CLI download metadata...');
         const release = JSON.parse(await text('https://api.github.com/repos/cli/cli/releases/latest'));
         const asset = release.assets.find(item => item.name.endsWith(`_${spec.ghOs}_${spec.ghArch}.${spec.ghExtension}`));
         const checksums = release.assets.find(item => item.name.endsWith('_checksums.txt'));
@@ -235,14 +341,10 @@ async function main() {
         await download(asset.browser_download_url, archive, checksumFor(await text(checksums.browser_download_url), asset.name));
         await extract(archive, join(work, 'extracted'), env);
         gh = await findFile(join(work, 'extracted'), ['bin', spec.windows ? 'gh.exe' : 'gh']);
-        if (!gh) throw new Error('GitHub CLI executable missing from verified archive.');
+        if (!gh || !await healthy(gh)) throw new Error('GitHub CLI executable missing or cannot run on this system.');
       }
-      ghBin = dirname(gh); addPath(ghBin);
-      if (!await ask('Sign in if needed and configure Git’s GitHub credential helper for your user account?')) throw new Error('GitHub setup cancelled.');
-      if ((await capture(gh, ['auth', 'status', '--hostname', 'github.com'])).code !== 0) {
-        await invoke(gh, ['auth', 'login', '--hostname', 'github.com', '--git-protocol', 'https', '--web'], { timeout: 900_000 });
-      }
-      await invoke(gh, ['auth', 'setup-git', '--hostname', 'github.com']);
+      ghPath = gh; ghBin = dirname(gh); addPath(ghBin);
+      return gh;
       },
     });
     let ref = stableTag(refs.stdout);
@@ -252,7 +354,21 @@ async function main() {
     }
     console.log(`Selected ${REPOSITORY} ${ref}. Stable discovery follows Git tags, not completed GitHub release uploads.`);
 
-    let javaHome = env.JAVA_HOME;
+    const javaName = spec.windows ? 'java.exe' : 'java';
+    const healthyJava = async java => {
+      try {
+        const javac = join(dirname(java), spec.windows ? 'javac.exe' : 'javac');
+        if (!await exists(javac)) return false;
+        const version = await capture(java, ['-version'], { timeout: 15_000 });
+        const compiler = await capture(javac, ['-version'], { timeout: 15_000 });
+        return version.code === 0 && /version\s+"21[."]/u.test(version.stderr + version.stdout)
+          && compiler.code === 0 && /javac 21(?:\.|\s|$)/u.test(compiler.stdout + compiler.stderr);
+      } catch { return false; }
+    };
+    const managedJava = await findManagedRuntime(runtimes, 'jdk21-', ['bin', javaName], healthyJava);
+    let javaHome = managedJava ? dirname(dirname(managedJava)) : env.JAVA_HOME;
+    if (managedJava) console.log(`Reusing installed JDK 21: ${javaHome}`);
+    if (javaHome && !await healthyJava(join(javaHome, 'bin', javaName))) javaHome = undefined;
     if (!javaHome && spec.platform === 'darwin') {
       const found = await capture('/usr/libexec/java_home', ['-v', '21']); if (found.code === 0) javaHome = found.stdout.trim();
     }
@@ -260,10 +376,9 @@ async function main() {
       const java = await executable('java', env);
       if (java) javaHome = dirname(dirname(await realpath(java)));
     }
-    const javaName = spec.windows ? 'java.exe' : 'java';
-    const javaResult = javaHome && await exists(join(javaHome, 'bin', javaName)) ? await capture(join(javaHome, 'bin', javaName), ['-version']) : null;
-    if (!javaResult || javaResult.code !== 0 || !/version\s+"21[."]/u.test(javaResult.stderr + javaResult.stdout)) {
+    if (!javaHome || !await healthyJava(join(javaHome, 'bin', javaName))) {
       if (!await ask('Install Eclipse Temurin JDK 21 in Mandalin’s user folder to build the Burp extension? No system Java will be replaced.')) throw new Error('JDK 21 is required by this installer.');
+      console.log('Fetching JDK 21 download metadata...');
       const releases = JSON.parse(await text(`https://api.adoptium.net/v3/assets/latest/21/hotspot?architecture=${spec.javaArch}&image_type=jdk&os=${spec.javaOs}`));
       const asset = releases[0]?.binary?.package;
       if (!asset?.name || !asset.link || !asset.checksum) throw new Error('No Temurin JDK archive for this platform.');
@@ -271,7 +386,7 @@ async function main() {
       await download(asset.link, archive, asset.checksum);
       await extract(archive, join(work, 'extracted'), env);
       const java = await findFile(join(work, 'extracted'), ['bin', javaName]);
-      if (!java) throw new Error('Java executable missing from verified archive.');
+      if (!java || !await healthyJava(java)) throw new Error('JDK 21 executable missing or cannot run on this system.');
       javaHome = dirname(dirname(java));
     }
     env.JAVA_HOME = javaHome; addPath(join(javaHome, 'bin'));
@@ -280,6 +395,12 @@ async function main() {
       await invoke('git', ['-C', root, 'fetch', 'origin', ref === 'main' ? 'refs/heads/main' : `refs/tags/${ref}`]);
       await invoke('git', ['-C', root, 'merge', '--ff-only', 'FETCH_HEAD']);
     } else await invoke('git', ['clone', '--branch', ref, '--single-branch', REPOSITORY_URL, root]);
+    if (ghPath && env.GIT_CONFIG_COUNT && env[`GIT_CONFIG_VALUE_${Number(env.GIT_CONFIG_COUNT) - 2}`]?.endsWith(' auth git-credential')) {
+      // Future updates need the same helper, but only this managed checkout gets it.
+      await invoke('git', ['-C', root, 'config', '--local', '--replace-all', 'credential.https://github.com.helper', '']);
+      await invoke('git', ['-C', root, 'config', '--local', '--add', 'credential.https://github.com.helper', `!${shellQuote(ghPath.replaceAll('\\', '/'))} auth git-credential`]);
+      await invoke('git', ['-C', root, 'config', '--local', '--replace-all', `url.${REPOSITORY_URL}.insteadOf`, REPOSITORY_URL]);
+    }
     // The app installer runs npm ci/build/doctor and owns the CLI registration.
     await invoke(process.execPath, [join(root, 'installer', 'install.mjs')], { cwd: root, timeout: 1_800_000 });
 

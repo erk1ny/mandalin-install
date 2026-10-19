@@ -16,7 +16,7 @@ mandalin_bootstrap() {
   # Keep Bash itself on the curl pipe; only interactive children inherit the TTY.
   # Redirecting interpreter stdin would make it execute terminal input after setup.
   export MANDALIN_BOOTSTRAP_INTERACTIVE=1
-  local os arch stage runtime sums archive version expected actual node_bin answer
+  local os arch stage runtime sums archive version expected actual node_bin answer candidate
   os=$(uname -s); arch=$(uname -m)
   case "$os" in
     MINGW*|MSYS*)
@@ -33,13 +33,31 @@ mandalin_bootstrap() {
     *) printf 'Unsupported OS: %s\n' "$os" >&2; return 1 ;;
   esac
   case "$arch" in x86_64|amd64) arch=x64 ;; arm64|aarch64) arch=arm64 ;; *) printf 'Unsupported architecture: %s\n' "$arch" >&2; return 1 ;; esac
-  if command -v node >/dev/null 2>&1 && node -e 'const [a,b]=process.versions.node.split(".").map(Number); process.exit(a>22||(a===22&&b>=19)?0:1)' 2>/dev/null; then
-    node_bin=$(command -v node)
-  else
+  runtime="${MANDALIN_HOME:-$HOME/.mandalin}/runtimes"
+  # Reuse successful downloads even if a later step was cancelled before PATH setup.
+  # The wrapper owns crash diagnostics (and disables core dumps) for broken PATH Nodes.
+  mandalin_node_works() (
+    ulimit -c 0 2>/dev/null || true
+    "$1" -e 'const [a,b]=process.versions.node.split(".").map(Number); process.exit(a>22||(a===22&&b>=19)?0:1)' >/dev/null 2>&1
+    local probe_status=$?
+    exit "$probe_status"
+  ) 2>/dev/null
+  node_bin=''
+  for candidate in "$runtime"/node-*/node-v*-"$os"-"$arch"/bin/node; do
+    if [[ -x "$candidate" && -f "${candidate%/bin/node}/lib/node_modules/npm/bin/npm-cli.js" ]] && mandalin_node_works "$candidate"; then
+      node_bin="$candidate"
+      printf 'Reusing installed Node runtime: %s\n' "$node_bin"
+      break
+    fi
+  done
+  if [[ -z "$node_bin" ]] && command -v node >/dev/null 2>&1; then
+    candidate=$(command -v node)
+    if mandalin_node_works "$candidate"; then node_bin="$candidate"; fi
+  fi
+  if [[ -z "$node_bin" ]]; then
     printf '%s\n' 'Node.js 22.19+ is missing or cannot run. Install a checksum-verified Node 24 runtime in Mandalin’s user folder? [y/N]' >&3
     read -r answer <&3
     case "$answer" in y|Y|yes|YES) ;; *) printf '%s\n' 'Cancelled; Node was not installed.'; return 1 ;; esac
-    runtime="${MANDALIN_HOME:-$HOME/.mandalin}/runtimes"
     mkdir -p "$runtime"
     stage=$(mktemp -d "$runtime/node-XXXXXXXX")
     sums="$stage/SHASUMS256.txt"
