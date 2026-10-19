@@ -1,16 +1,11 @@
-# Mandalin guided installer
+# Install Mandalin
 
-This directory's `bootstrap.sh`, `bootstrap.ps1` and `bootstrap.mjs` are a small,
-credential-free bootstrap. The Mandalin application repository remains private.
-No account tokens, provider configuration, target traffic or research files are
-included. The installer never asks users to paste a token into the curl command.
+Run the command for your platform and follow the prompts.
 
 ## One command
 
-The scripts below are distributed through the public, installer-only
-[`erk1ny/mandalin-install`](https://github.com/erk1ny/mandalin-install) repository.
-The application repository remains private: the installer guides GitHub login
-when needed, and your account must have permission to access Mandalin.
+You'll need a GitHub account with access to Mandalin. The installer guides login
+when needed.
 
 macOS, glibc Linux, or Windows **Git Bash**:
 
@@ -23,10 +18,6 @@ Native Windows **PowerShell** (no Bash required):
 ```powershell
 & ([scriptblock]::Create((Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/erk1ny/mandalin-install/main/bootstrap.ps1').Content))
 ```
-
-Both commands download and execute installer code. Review the public scripts
-first if your organization's policy requires it. `curl -f` rejects HTTP errors;
-the shell entry point only invokes setup at the end of its complete function.
 
 ## What happens
 
@@ -78,16 +69,3 @@ Use an absolute `MANDALIN_HOME` to relocate the managed data/checkouts. The norm
 installer also honors `MANDALIN_PREFIX` and explicit Pi directory overrides.
 For another public host, set `MANDALIN_BOOTSTRAP_URL` to the HTTPS directory
 containing all three bootstrap files for the bootstrap process.
-
-## Publishing the bootstrap (maintainers)
-
-`npm run package:bootstrap` produces only these scripts, this README and checksums
-under `release-artifacts/bootstrap`. Review that allowlisted directory and publish
-it to the installer-only public repository after owner approval. Never copy the
-whole Mandalin checkout, `.mandalin`, sessions, auth files or `.env` files there.
-Keep bootstrap source changes in the private Mandalin repo as the source of truth.
-Publish matching bootstrap updates after the application changes they require
-(for example the `mandalin setup` command) are available in the selected ref.
-
-For diagnostics without installation: `bash bootstrap.sh --check`,
-`powershell -File bootstrap.ps1 -Check`, and `node --check bootstrap.mjs`.
